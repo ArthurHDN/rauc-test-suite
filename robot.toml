@@ -1,0 +1,45 @@
+#:schema https://raw.githubusercontent.com/d-biehl/robotcode/refs/heads/main/etc/robot.toml.json
+#
+# Robot Framework / RobotCode configuration for the RAUC integration tests.
+# Normally used through run_tests.py (timestamped, auditable result directories);
+# it can also be used directly:  robotcode --profile safe robot
+name = "RAUC Integration Tests"
+paths = ["suites"]
+python-path = ["libraries"]
+output-dir = "results/adhoc"
+log-level = "DEBUG"
+default-profiles = ["safe"]
+
+[listeners]
+AuditListener = []
+
+[variables]
+# Everything below can be overridden with  run_tests.py -v NAME:VALUE
+MACHINE = "jetson-orin-nano-devkit-nvme"
+BOOT_TIMEOUT = "900"
+INSTALL_TIMEOUT = "1800"
+SOAK_CYCLES = "6"
+POWER_LOSS_PERCENT = "40"
+BOOT_FAILURE_ATTEMPTS = "5"
+
+# --------------------------------------------------------------------------- profiles
+# Tags: readonly < slot-change < rejected-install < install < reboot < power-loss < boot-failure
+#       plus soak (long).
+
+# No reboot and no installation. Slot-change tests only toggle the bootloader's primary slot
+# temporarily and restore it; rejected-install tests must not modify any slot.
+[profiles.safe]
+exclude-tags = ["install", "reboot", "power-loss", "boot-failure", "soak"]
+
+# Adds installation and reboot tests (sections 5, 6.4, 6.7, 6.8, 7.3, 7.6, 7.7).
+[profiles.update]
+exclude-tags = ["power-loss", "boot-failure", "soak"]
+
+# Everything required by the acceptance criteria of RAUC-TEST-PLAN.md
+# (sections 1-5, TC-6.1 - TC-6.6). Needs JETSON_POWER_CYCLE_CMD for hung boots.
+[profiles.acceptance]
+exclude-tags = ["soak"]
+
+# Acceptance plus the soak test (TC-7.1).
+[profiles.full]
+exclude-tags = []
