@@ -18,27 +18,38 @@ Upload Test Bundle
     RETURN    ${remote}
 
 Both Slots Should Be Bootable
-    ${nv}=    Get Nvbootctrl Info
-    Should Be Equal    ${nv}[slots][A]    normal    Slot A is not bootable
-    Should Be Equal    ${nv}[slots][B]    normal    Slot B is not bootable
+    ${bl}=    Get Bootloader State
+    Should Be Equal    ${bl}[slots][A]    normal    Slot A is not bootable
+    Should Be Equal    ${bl}[slots][B]    normal    Slot B is not bootable
 
 Cleanup Failure Test
     Collect Diagnostics On Failure
     Run Keyword And Ignore Error    Run On Target    rm -f ${TARGET_TMP}/rauc-test-*.raucb ${TARGET_TMP}/rauc-test-*.log
-    Run Keyword And Ignore Error    Restore Primary To Booted Slot
+    Run Keyword And Ignore Error    Restore Boot Configuration
+
+Reboot Expecting Fallback
+    [Documentation]    Reboot; a hung boot of the broken slot may need a power cycle (TARGET_POWER_CYCLE_CMD).
+    ${status}    ${msg}=    Run Keyword And Ignore Error
+    ...    Reboot Target And Reconnect    soft    ${BOOT_TIMEOUT}
+    FOR    ${attempt}    IN RANGE    ${BOOT_FAILURE_ATTEMPTS}
+        IF    '${status}' == 'PASS'    BREAK
+        Log    Device not reachable yet (attempt ${attempt}): ${msg}. The broken slot probably hangs the boot (no reset). Power-cycle the device by hand now (or set TARGET_POWER_CYCLE_CMD); every boot attempt uses one of the slot's tries and the previous slot boots once they are used up (3 tries on a Raspberry Pi: the reboot and 2 power cycles use them, the 3rd power cycle boots the previous slot).    WARN
+        ${status}    ${msg}=    Run Keyword And Ignore Error    Wait For Target    ${BOOT_TIMEOUT}
+    END
+    Should Be Equal    ${status}    PASS    Device never returned: ${msg}
 
 Recover From Boot Failure Test
     [Documentation]    Re-install the good bundle into the slot that held the broken image.
     Collect Diagnostics On Failure
     Run Keyword And Ignore Error    Run On Target    rm -f ${TARGET_TMP}/rauc-test-*.raucb
-    # The failed boots flagged the slot unbootable in the rootfs chain; that flag survives a reinstall.
+    # The failed boots flagged the slot unbootable in the bootloader; that flag may survive a reinstall.
     ${booted}=    Get Booted Bootname
     ${inactive}=    Other Bootname    ${booted}
-    Run Keyword And Ignore Error    Reset Rootfs Slot Status    ${inactive}
+    Run Keyword And Ignore Error    Reset Slot Boot Status    ${inactive}
     ${status}    ${msg}=    Run Keyword And Ignore Error    Install To Inactive Slot And Check
     Log    Restore of the inactive slot: ${status} ${msg}
     Run Keyword And Ignore Error    Restore Primary To Booted Slot
-    Run Keyword And Ignore Error    Reset Rootfs Slot Status    ${inactive}
+    Run Keyword And Ignore Error    Reset Slot Boot Status    ${inactive}
     Boot Chain Should Be Healthy
 
 
@@ -64,7 +75,9 @@ TC-6.2 Reject A Bundle With Wrong Compatible String
 
 TC-6.3 Reject A Plain Format Bundle
     [Documentation]    bundle-formats=-plain prevents the legacy format. Input: negative/plain-format.raucb
+    ...    Skipped on devices whose system.conf does not restrict the bundle formats.
     [Tags]    rejected-install
+    Require Feature    plain-format-rejection
     ${bundle}=    Require Negative Bundle    plain-format
     ${remote}=    Upload Test Bundle    ${bundle}    plain-format
     ${before}=    Capture Device State
@@ -84,8 +97,9 @@ TC-6.4 Corrupted Bundle
     Run On Target    cmp -s ${remote} ${corrupt}    expected_rc=1
     ${before}=    Capture Device State
     Install Should Fail    ${corrupt}    (?i)(verity|hash|signature|checksum|digest|verif|corrupt|invalid|fail|error)
-    # The inactive slot may be partially written, but must not be activated.
-    Boot Configuration Should Be Unchanged    ${before}
+    # The inactive slot may be partially written (RAUC flags it bad when the write starts on some
+    # bootloaders), but the active slot and the boot order must not change.
+    Boot Configuration Should Be Unchanged    ${before}    check_slot_status=${False}
 
 TC-6.5 Power Loss During Installation
     [Documentation]    Interrupting the write does not brick the device; the old slot still boots.
@@ -113,8 +127,8 @@ TC-6.5 Power Loss During Installation
     Should Be Equal    ${booted}    ${x}    Device did not boot the previous slot after power loss
     Root Should Be Slot    ${x}
     Wait Until Slot Is Good    ${x}
-    ${nv}=    Get Nvbootctrl Info
-    Should Be Equal    ${nv}[active]    ${x}    Interrupted install must not activate the other slot
+    ${bl}=    Get Bootloader State
+    Should Be Equal    ${bl}[active]    ${x}    Interrupted install must not activate the other slot
     # A subsequent install succeeds.
     ${remote}=    Upload Bundle
     Install Bundle Should Succeed    ${remote}
@@ -122,30 +136,32 @@ TC-6.5 Power Loss During Installation
 TC-6.6 Boot Failure Triggers Fallback
     [Documentation]    A new slot that fails to boot is not retried forever; the device falls back.
     ...    A bundle with an empty ext4 rootfs (no init) is installed (input negative/broken-rootfs.raucb).
-    ...    Hung boots need a power
-    ...    cycle: set JETSON_POWER_CYCLE_CMD to automate it (see README).
+    ...    Hung boots need a power cycle: set TARGET_POWER_CYCLE_CMD to automate it (see README).
+    ...    The broken slot must end up flagged unbootable in the bootloader (immediately or once its
+    ...    boot attempts are used up, depending on the device).
     [Tags]    install    reboot    boot-failure
     ${bundle}=    Require Negative Bundle    broken-rootfs
     ${x}=    Get Booted Bootname
     ${y}=    Other Bootname    ${x}
     ${remote}=    Upload Test Bundle    ${bundle}    broken-rootfs
     Install Bundle Should Succeed    ${remote}
-    ${nv}=    Get Nvbootctrl Info
-    Should Be Equal    ${nv}[active]    ${y}
-    ${status}    ${msg}=    Run Keyword And Ignore Error
-    ...    Reboot Target And Reconnect    soft    ${BOOT_TIMEOUT}
-    FOR    ${attempt}    IN RANGE    ${BOOT_FAILURE_ATTEMPTS}
-        IF    '${status}' == 'PASS'    BREAK
-        Log    Device not reachable yet (attempt ${attempt}): ${msg}    WARN
-        ${status}    ${msg}=    Run Keyword And Ignore Error    Wait For Target    ${BOOT_TIMEOUT}
-    END
-    Should Be Equal    ${status}    PASS    Device never returned: ${msg}
+    ${bl}=    Get Bootloader State
+    Should Be Equal    ${bl}[active]    ${y}
+    Reboot Expecting Fallback
     ${booted}=    Get Booted Bootname
     Should Be Equal    ${booted}    ${x}    Device did not fall back to the previous slot
     Wait Until Slot Is Good    ${x}
-    # The bootloader chain keeps reporting 'normal'; the failed rootfs is flagged in the rootfs chain.
-    ${nv}=    Get Nvbootctrl Info    rootfs
-    Should Be Equal    ${nv}[slots][${y}]    unbootable    The broken slot must be flagged unbootable
+    # Devices that count boot attempts retry the broken slot until the attempts are used up.
+    FOR    ${round}    IN RANGE    ${BOOT_FAILURE_ATTEMPTS}
+        ${bl}=    Get Bootloader State
+        IF    '${bl}[slots][${y}]' == 'unbootable'    BREAK
+        Log    Slot ${y} still has boot attempts left, rebooting (round ${round})    WARN
+        Reboot Expecting Fallback
+        ${booted}=    Get Booted Bootname
+        Should Be Equal    ${booted}    ${x}    Device did not fall back to the previous slot
+    END
+    ${bl}=    Get Bootloader State
+    Should Be Equal    ${bl}[slots][${y}]    unbootable    The broken slot must be flagged unbootable
     ${rs}=    Get Rauc Status
     ${slot}=    Bootname To Rauc Slot    ${y}
     Should Not Be Equal    ${rs}[slots][${slot}][boot_status]    good
@@ -159,14 +175,14 @@ TC-6.7 Mark-Bad Path Via RAUC
     ${y}=    Other Bootname    ${x}
     Restore Primary To Booted Slot
     Run On Target    rauc status mark-bad
-    ${nv}=    Get Nvbootctrl Info
-    Should Be Equal    ${nv}[active]    ${y}    Active slot after mark-bad
+    ${bl}=    Get Bootloader State
+    Should Be Equal    ${bl}[active]    ${y}    Active slot after mark-bad
     Reboot And Verify Slot    ${y}
     Wait Until Slot Is Good    ${y}
     ${slot_x}=    Bootname To Rauc Slot    ${x}
     Run On Target    rauc status mark-active ${slot_x}
-    ${nv}=    Get Nvbootctrl Info
-    Should Be Equal    ${nv}[active]    ${x}    Active slot after mark-active
+    ${bl}=    Get Bootloader State
+    Should Be Equal    ${bl}[active]    ${x}    Active slot after mark-active
     ${rs}=    Get Rauc Status
     Should Be Equal    ${rs}[primary_bootname]    ${x}
 
@@ -177,8 +193,8 @@ TC-6.8 Manual Slot Switching Through RAUC
     ${x}=    Get Booted Bootname
     ${y}=    Other Bootname    ${x}
     Run On Target    rauc status mark-active other
-    ${nv}=    Get Nvbootctrl Info
-    Should Be Equal    ${nv}[active]    ${y}
+    ${bl}=    Get Bootloader State
+    Should Be Equal    ${bl}[active]    ${y}
     Reboot And Verify Slot    ${y}
     Wait Until Slot Is Good    ${y}
     ${rs}=    Get Rauc Status

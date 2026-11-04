@@ -7,24 +7,20 @@ Test Tags           section-7
 Test Teardown       Cleanup Robustness Test
 
 
-*** Variables ***
-# Kernel messages that indicate filesystem / NVMe problems.
-${KERNEL_ERROR_REGEX}       EXT4-fs error|I/O error|nvme[0-9a-z]*:.*(timeout|reset|fail|error)
-
-
 *** Keywords ***
 Cleanup Robustness Test
     Collect Diagnostics On Failure
     Run Keyword And Ignore Error    Run On Target    rm -f ${TARGET_TMP}/rauc-test-*.log
-    Run Keyword And Ignore Error    Restore Primary To Booted Slot
+    Run Keyword And Ignore Error    Restore Boot Configuration
 
 Kernel Log Should Be Clean
-    ${r}=    Run On Target    dmesg | grep -E '${KERNEL_ERROR_REGEX}'    expected_rc=any
-    Should Be Equal As Integers    ${r.rc}    1    Kernel log contains filesystem/NVMe errors:\n${r.stdout}
+    [Documentation]    No filesystem / storage errors; the pattern comes from the device profile.
+    ${r}=    Run On Target    dmesg | grep -E '${PROFILE}[kernel_error_regex]'    expected_rc=any
+    Should Be Equal As Integers    ${r.rc}    1    Kernel log contains filesystem/storage errors:\n${r.stdout}
 
 Inactive Slot Should Not Be Mounted
     [Arguments]    ${inactive}
-    ${part}=    Get Partlabel Block Name    ${inactive}
+    ${part}=    Get Slot Block Name    ${inactive}
     ${r}=    Run On Target    grep -c "/dev/${part} " /proc/mounts    expected_rc=any
     Should Be Equal As Integers    ${r.stdout}    0    Inactive slot ${inactive} is mounted
 
@@ -34,12 +30,11 @@ Image Written To Slot Should Match Bundle
     ${image}=    Set Variable    ${bundle_info}[images][0]
     Should Be True    $image['size'] is not None    Image size could not be parsed from 'rauc info'
     Should Be True    $image['sha256'] is not None    Image checksum could not be parsed from 'rauc info'
-    ${label}=    Bootname To Partlabel    ${bootname}
+    ${dev}=    Get Slot Device    ${bootname}
     # BusyBox head has no -c; dd with iflag=count_bytes is not available either, so read whole
     # MiB blocks and the remainder separately.
     ${blocks}=    Evaluate    int($image['size']) // 1048576
     ${rest}=    Evaluate    int($image['size']) % 1048576
-    ${dev}=    Set Variable    /dev/disk/by-partlabel/${label}
     ${r}=    Run On Target
     ...    ( dd if=${dev} bs=1048576 count=${blocks} 2>/dev/null; dd if=${dev} bs=1048576 skip=${blocks} count=1 2>/dev/null | dd bs=1 count=${rest} 2>/dev/null ) | sha256sum
     ...    timeout=900
@@ -70,13 +65,13 @@ TC-7.1 Repeated Update Cycles
 
 TC-7.2 Filesystem Health Of Both Slots
     [Tags]    readonly
-    Run On Target    dmesg | grep -iE 'ext4|i/o error|nvme' | tail    expected_rc=any
+    Run On Target    dmesg | grep -iE '${PROFILE}[storage_log_regex]' | tail    expected_rc=any
     Kernel Log Should Be Clean
     ${has_fsck}=    Target Has Command    e2fsck
     Skip If    not ${has_fsck}    e2fsck is not installed in the image; only the kernel log was checked
     ${inactive}=    Get Inactive Bootname
-    ${label}=    Bootname To Partlabel    ${inactive}
-    Run On Target    e2fsck -fn /dev/disk/by-partlabel/${label}    timeout=900
+    ${dev}=    Get Slot Device    ${inactive}
+    Run On Target    e2fsck -fn ${dev}    timeout=900
 
 TC-7.3 Rootfs Content Identical To Bundle Image
     [Documentation]    The image RAUC wrote to the inactive slot is bit-identical to the bundle's image.
@@ -87,12 +82,12 @@ TC-7.3 Rootfs Content Identical To Bundle Image
 
 TC-7.4 Bootloader Slot State Consistency
     [Tags]    readonly
-    ${nv}=    Get Nvbootctrl Info
+    ${bl}=    Get Bootloader State
     ${rs}=    Get Rauc Status
-    Should Be Equal    ${nv}[current]    ${rs}[booted_bootname]    Current bootloader slot vs RAUC booted slot
-    Should Be Equal    ${nv}[active]    ${rs}[primary_bootname]    Active bootloader slot vs RAUC primary slot
+    Should Be Equal    ${bl}[current]    ${rs}[booted_bootname]    Current bootloader slot vs RAUC booted slot
+    Should Be Equal    ${bl}[active]    ${rs}[primary_bootname]    Active bootloader slot vs RAUC primary slot
     FOR    ${bootname}    IN    A    B
-        Should Not Be Equal    ${nv}[slots][${bootname}]    unbootable    Slot ${bootname} is unbootable
+        Should Not Be Equal    ${bl}[slots][${bootname}]    unbootable    Slot ${bootname} is unbootable
     END
     Boot Chain Should Be Healthy
 
@@ -106,9 +101,12 @@ TC-7.5 No Service Regressions
     Run On Target    ip a
     ${addr}=    Run On Target    ip -o addr show scope global    expected_rc=any
     Should Not Be Empty    ${addr.stdout}    No global IP address configured
-    ${nic}=    Run On Target    lsmod | grep -E 'r8168|r8169'    expected_rc=any
-    IF    $nic.rc != 0
-        Log    r8168/r8169 module is not loaded (may be built in or a different NIC is used)    WARN
+    ${nic_regex}=    Set Variable    ${PROFILE}[nic_module_regex]
+    IF    $nic_regex
+        ${nic}=    Run On Target    lsmod | grep -E '${nic_regex}'    expected_rc=any
+        IF    $nic.rc != 0
+            Log    NIC module (${nic_regex}) is not loaded (may be built in or a different NIC is used)    WARN
+        END
     END
 
 TC-7.6 Concurrent Install Protection

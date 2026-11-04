@@ -49,21 +49,40 @@ def parse_env_file(path: str | os.PathLike) -> dict[str, str]:
     return values
 
 
+# Settings were called JETSON_* before the suite became device independent; the old names keep working.
+_LEGACY_ALIASES = {"TARGET_": "JETSON_", "RAUC_TESTS_ENV_FILE": "JETSON_ENV_FILE"}
+
+
+def _names_for(name: str) -> list[str]:
+    names = [name]
+    for new, old in _LEGACY_ALIASES.items():
+        if name == new or (new.endswith("_") and name.startswith(new)):
+            names.append(old + name[len(new):])
+    return names
+
+
 def env_file_path() -> Path:
-    return Path(os.environ.get("JETSON_ENV_FILE") or DEFAULT_ENV_FILE)
+    for name in _names_for("RAUC_TESTS_ENV_FILE"):
+        if os.environ.get(name):
+            return Path(os.environ[name])
+    return DEFAULT_ENV_FILE
 
 
 def get_setting(name: str, default: str | None = None) -> str | None:
     """Look up a setting: process environment first, then the env file.
 
+    ``TARGET_*`` settings also accept their legacy ``JETSON_*`` name.
     A variable that is present but empty is returned as ``""`` (needed for
     empty passwords); only a missing variable yields *default*.
     """
-    if name in os.environ:
-        return os.environ[name]
+    names = _names_for(name)
+    for candidate in names:
+        if candidate in os.environ:
+            return os.environ[candidate]
     file_values = parse_env_file(env_file_path())
-    if name in file_values:
-        return file_values[name]
+    for candidate in names:
+        if candidate in file_values:
+            return file_values[candidate]
     return default
 
 

@@ -1,8 +1,21 @@
-# RAUC integration tests (Jetson Orin Nano)
+# RAUC integration tests
 
 Automated Robot Framework implementation of `RAUC-TEST-PLAN.md` (in this folder, so it is part of the QA
 package). Every test case `TC-x.y` of the plan is one Robot test; the target is reached over SSH. Every run is
 stored in its own directory so each result can be audited and reproduced.
+
+The tests are hardware independent. Everything that differs between devices (boot loader, partition layout, how
+the A/B state is read) lives in one plugin per device under `libraries/devices/`. Supported devices
+(`./run_tests.py --list-devices`):
+
+| `DEVICE` (= Yocto `MACHINE` = RAUC `compatible`) | Hardware |
+|---|---|
+| `jetson-orin-nano-devkit-nvme` | Jetson Orin Nano devkit, NVMe |
+| `jetson-orin-nano-devkit` | Jetson Orin Nano devkit, SD card |
+| `raspberrypi4-64` | Raspberry Pi 4 (U-Boot) |
+
+Device specifics and skipped tests are listed in the appendix of `RAUC-TEST-PLAN.md`. To support another device see
+`DEVICES.md`.
 
 This folder is self-contained. It does not build, sign or generate anything and does not need the Yocto
 repository: everything the tests need is supplied through an **inputs directory** (see below).
@@ -19,14 +32,17 @@ Only Python 3.10+ and the packages in `requirements.txt` are needed on the machi
 
 ## Inputs directory
 
-Default `rauc-test-suite/inputs/`, or any folder given with `--inputs DIR`. All files are optional except the bundle;
-tests that need a missing optional file are skipped (and say which file is missing).
+Default `rauc-test-suite/inputs/`, or any folder given with `--inputs DIR`. The inputs belong to one device: use a
+separate directory per device (the bundle, `expected/system.conf` and the negative bundles carry its compatible
+string). All files are optional except the bundle; tests that need a missing optional file are skipped (and say
+which file is missing).
 
 ```
 <inputs>/
   bundle/<name>.raucb          bundle under test (newest file used); or --bundle FILE
-  expected/system.conf         reference /etc/rauc/system.conf of the image (TC-1.2); the @RAUC_COMPATIBLE@ and
-                               @DATA_MOUNT_POINT@ placeholders are substituted by the test (MACHINE, DATA_MOUNT_POINT)
+  expected/system.conf         reference /etc/rauc/system.conf of the image (TC-1.2); the build-time placeholders are
+                               substituted by the test: @RAUC_COMPATIBLE@ and @DATA_MOUNT_POINT@ (Jetson),
+                               @@MACHINE@@ (Raspberry Pi)
   expected/ca.cert.pem         reference keyring certificate (TC-1.4)
   expected/rootfs.sha256       "<sha256>  <name>" of the rootfs image inside the bundle (TC-4.3)
   negative/wrong-signature.raucb   signed by an unknown certificate   (TC-6.1)
@@ -43,6 +59,7 @@ The inputs are produced on the build host (where the Yocto build output and the 
 tools/prepare_qa_inputs.py --out qa-inputs                  # newest bundle from the build output + negative bundles
 tools/prepare_qa_inputs.py --out qa-inputs --build          # run the kas build first
 tools/prepare_qa_inputs.py --out qa-inputs --package        # also write rauc-qa-<timestamp>.tar.gz (+ .sha256)
+tools/prepare_qa_inputs.py --machine raspberrypi4-64 --out qa-inputs-rpi   # another device (default: detected)
 ```
 
 The generator needs `rauc`, `openssl` and `mke2fs` (negative bundles; `--skip-negative` to omit them), and `kas`
@@ -57,13 +74,16 @@ Settings are read from the process environment first, then from `.env` (or `--en
 
 | Variable | Meaning |
 |---|---|
-| `JETSON_HOST` | required, IP or hostname |
-| `JETSON_USER` | default `root` |
-| `JETSON_PASSWORD` | may be empty or unset (empty-password login, e.g. `debug-tweaks` images) |
-| `JETSON_PORT` | default `22` |
-| `JETSON_KEY_FILE`, `JETSON_KEY_PASSPHRASE` | optional key login, tried before the password |
-| `JETSON_CONNECT_TIMEOUT` | SSH connect timeout in seconds, default `15` |
-| `JETSON_POWER_CYCLE_CMD`, `JETSON_POWER_CYCLE_AFTER` | optional command run on the test machine to power-cycle a hung device (TC-6.6) |
+| `DEVICE` | required (or `--device`): device under test, see `--list-devices` |
+| `TARGET_HOST` | required, IP or hostname |
+| `TARGET_USER` | default `root` |
+| `TARGET_PASSWORD` | may be empty or unset (empty-password login, e.g. `debug-tweaks` images) |
+| `TARGET_PORT` | default `22` |
+| `TARGET_KEY_FILE`, `TARGET_KEY_PASSPHRASE` | optional key login, tried before the password |
+| `TARGET_CONNECT_TIMEOUT` | SSH connect timeout in seconds, default `15` |
+| `TARGET_POWER_CYCLE_CMD`, `TARGET_POWER_CYCLE_AFTER` | optional command run on the test machine to power-cycle a hung device (TC-6.6; required on the Raspberry Pi) |
+
+The former `JETSON_*` names (and `JETSON_ENV_FILE`) are still accepted; `TARGET_*` wins if both are set.
 
 Authentication order: key, password (including the empty one), SSH "none". The password is never passed as a
 Robot variable, never put on a command line and never written to the results. `--ask-password` prompts for it
@@ -72,7 +92,9 @@ Robot variable, never put on a command line and never written to the results. `-
 ## Running
 
 ```bash
-./run_tests.py --inputs /path/to/qa-inputs                  # profile "safe"
+./run_tests.py --list-devices                               # supported devices
+./run_tests.py --device raspberrypi4-64 --inputs qa-inputs-rpi   # profile "safe"; DEVICE may also be set in .env
+./run_tests.py --inputs /path/to/qa-inputs                  # device from .env
 ./run_tests.py --inputs qa-inputs --profile update
 ./run_tests.py --inputs qa-inputs --bundle /other/bundle.raucb   # override the bundle only
 ./run_tests.py --profile acceptance --label before-release
@@ -114,7 +136,7 @@ results/<UTC timestamp>[_label]/        results/latest -> newest run
                        (rauc status/info output, journals, dmesg, downloaded files, ...)
 ```
 
-Failed tests additionally collect diagnostics (journal, `rauc status`, `nvbootctrl`) in their artifact directory.
+Failed tests additionally collect diagnostics (journal, `rauc status`, the boot loader state commands of the device) in their artifact directory.
 To reproduce a run: provide the password and run `results/<run>/reproduce.sh` (set `TESTS_DIR` to an unpacked
 `inputs/rauc-tests-sources.tar.gz` to use exactly the same test sources).
 Use `--bundle-archive none` to skip keeping a copy of the inputs in the results (the paths and checksums are still
@@ -124,16 +146,28 @@ recorded).
 
 - `suites/` - `01_installation` ... `07_robustness`, plus `__init__.robot` (connection, initial-state capture, final slot restore)
 - `resources/common.resource` - shared variables and keywords
-- `libraries/JetsonTarget.py` - SSH execution with audit logging; `TestInputs.py` - inputs discovery, verification and
-  archiving; `RaucHelpers.py` - parsers/helpers; `AuditListener.py` - per-test records; `audit_common.py` - settings and hashing
+- `libraries/TargetSSH.py` - SSH execution with audit logging; `DeviceUnderTest.py` - keyword library that delegates
+  to the selected device plugin; `devices/` - one plugin per device (`base.py` = contract, `_template.py` = starting
+  point); `TestInputs.py` - inputs discovery, verification and archiving; `RaucHelpers.py` - parsers/helpers;
+  `AuditListener.py` - per-test records; `audit_common.py` - settings (with legacy aliases) and hashing
+- `tests/` - unit tests of the plugins and settings against fake targets (no device needed)
 - `robot.toml` - RobotCode/Robot options and profiles; `run_tests.py` - runner that builds the result directory
   (re-executes itself with `.venv/bin/python` when the current interpreter lacks the dependencies)
-- `RAUC-TEST-PLAN.md` - the test plan; `env.example` - template for `.env`; `requirements.txt` - Python dependencies
+- `RAUC-TEST-PLAN.md` - the test plan; `DEVICES.md` - how to add a device; `env.example` - template for `.env`;
+  `requirements.txt` - Python dependencies
+
+## Unit tests
+
+The device plugins and the settings are tested without hardware (stdlib `unittest`, fake SSH targets):
+
+```bash
+.venv/bin/python -m unittest discover -s tests
+```
 
 ## Safety notes
 
 - `update` and higher profiles overwrite the inactive rootfs slot and reboot the device; keep console/power access ready.
 - TC-6.5 cuts the install with a hard (sysrq) reset at `POWER_LOSS_PERCENT` progress; TC-6.6 installs a bundle with an
   empty rootfs to force a failed boot.
-- Variables can be set with `-v NAME:VALUE`: `MACHINE`, `DATA_MOUNT_POINT`, `BOOT_TIMEOUT`, `INSTALL_TIMEOUT`,
+- Variables can be set with `-v NAME:VALUE`: `DEVICE`, `DATA_MOUNT_POINT`, `BOOT_TIMEOUT`, `INSTALL_TIMEOUT`,
   `SOAK_CYCLES`, `POWER_LOSS_PERCENT`, `BOOT_FAILURE_ATTEMPTS`.

@@ -5,17 +5,17 @@ the env file, see ``audit_common.get_setting``) so the password never appears
 as a Robot keyword argument and therefore never ends up in ``log.html`` or
 ``output.xml``.
 
-Settings
---------
-``JETSON_HOST``              required, IP / hostname of the target
-``JETSON_USER``              default ``root``
-``JETSON_PASSWORD``          may be empty / unset (empty-password login)
-``JETSON_PORT``              default ``22``
-``JETSON_KEY_FILE``          optional private key (tried before the password)
-``JETSON_KEY_PASSPHRASE``    optional passphrase for the key
-``JETSON_CONNECT_TIMEOUT``   default ``15`` seconds
-``JETSON_POWER_CYCLE_CMD``   optional host command that power-cycles the device
-``JETSON_POWER_CYCLE_AFTER`` seconds to wait for a boot before running it (300)
+Settings (the legacy ``JETSON_*`` names are still accepted)
+-----------------------------------------------------------
+``TARGET_HOST``              required, IP / hostname of the target
+``TARGET_USER``              default ``root``
+``TARGET_PASSWORD``          may be empty / unset (empty-password login)
+``TARGET_PORT``              default ``22``
+``TARGET_KEY_FILE``          optional private key (tried before the password)
+``TARGET_KEY_PASSPHRASE``    optional passphrase for the key
+``TARGET_CONNECT_TIMEOUT``   default ``15`` seconds
+``TARGET_POWER_CYCLE_CMD``   optional host command that power-cycles the device
+``TARGET_POWER_CYCLE_AFTER`` seconds to wait for a boot before running it, and between repeats (300)
 
 Every command (target and host) is recorded in the per-test ``commands.log``
 and in the run-wide ``audit/commands.jsonl`` together with exit code, stdout,
@@ -81,8 +81,8 @@ class CommandResult:
         return f"rc={self.rc}\n{self.stdout}"
 
 
-class JetsonTarget:
-    """Keywords to drive the Jetson over SSH and to run commands on the host."""
+class TargetSSH:
+    """Keywords to drive the device under test over SSH and to run commands on the host."""
 
     ROBOT_LIBRARY_SCOPE = "GLOBAL"
     ROBOT_LIBRARY_VERSION = "1.0"
@@ -97,21 +97,21 @@ class JetsonTarget:
         return ac.get_setting(name, default)
 
     def _conn_params(self) -> dict:
-        host = self._setting("JETSON_HOST")
+        host = self._setting("TARGET_HOST")
         if not host:
             raise AssertionError(
-                "JETSON_HOST is not set. Provide it via the environment or the env file "
+                "TARGET_HOST is not set. Provide it via the environment or the env file "
                 f"({ac.env_file_path()}); see env.example."
             )
         return {
             "host": host,
-            "port": int(self._setting("JETSON_PORT", "22") or "22"),
-            "user": self._setting("JETSON_USER", "root") or "root",
+            "port": int(self._setting("TARGET_PORT", "22") or "22"),
+            "user": self._setting("TARGET_USER", "root") or "root",
             # An empty or unset password means "empty password" login.
-            "password": self._setting("JETSON_PASSWORD", "") or "",
-            "key_file": self._setting("JETSON_KEY_FILE", "") or "",
-            "key_passphrase": self._setting("JETSON_KEY_PASSPHRASE", "") or "",
-            "timeout": float(self._setting("JETSON_CONNECT_TIMEOUT", "15") or "15"),
+            "password": self._setting("TARGET_PASSWORD", "") or "",
+            "key_file": self._setting("TARGET_KEY_FILE", "") or "",
+            "key_passphrase": self._setting("TARGET_KEY_PASSPHRASE", "") or "",
+            "timeout": float(self._setting("TARGET_CONNECT_TIMEOUT", "15") or "15"),
         }
 
     def get_target_settings(self) -> dict:
@@ -252,7 +252,8 @@ class JetsonTarget:
         cwd: str | None = None,
     ) -> CommandResult:
         """Run a shell command on the machine executing the tests."""
-        env = {k: v for k, v in os.environ.items() if k not in ("JETSON_PASSWORD", "JETSON_KEY_PASSPHRASE")}
+        secrets = ("TARGET_PASSWORD", "TARGET_KEY_PASSPHRASE", "JETSON_PASSWORD", "JETSON_KEY_PASSPHRASE")
+        env = {k: v for k, v in os.environ.items() if k not in secrets}
         if float(timeout) >= _LONG_COMMAND_S:
             _say(f"Running on host (timeout {float(timeout):.0f}s): {_short(command)}")
         started = time.monotonic()
@@ -426,8 +427,10 @@ class JetsonTarget:
         """Reboot (``soft``: systemctl reboot, ``sysrq``: immediate reset) and reconnect.
 
         Returns the seconds until SSH was available again with a new boot id.
-        If ``JETSON_POWER_CYCLE_CMD`` is configured and no boot happened within
-        ``JETSON_POWER_CYCLE_AFTER`` seconds, the command is run once.
+        If ``TARGET_POWER_CYCLE_CMD`` is configured and no boot happened within
+        ``TARGET_POWER_CYCLE_AFTER`` seconds, the command is run, and again every
+        ``TARGET_POWER_CYCLE_AFTER`` seconds while the target stays away (devices that count boot
+        attempts need one power cycle per attempt before they fall back).
         """
         commands = {
             "soft": "systemctl reboot || reboot",
@@ -452,16 +455,17 @@ class JetsonTarget:
         """Wait until SSH works (and, if given, the boot id differs from *previous_boot_id*)."""
         deadline = time.monotonic() + float(timeout)
         start = time.monotonic()
-        cycle_cmd = self._setting("JETSON_POWER_CYCLE_CMD", "") or ""
-        cycle_after = float(self._setting("JETSON_POWER_CYCLE_AFTER", "300") or "300")
-        cycled = False
+        cycle_cmd = self._setting("TARGET_POWER_CYCLE_CMD", "") or ""
+        cycle_after = float(self._setting("TARGET_POWER_CYCLE_AFTER", "300") or "300")
+        last_cycle = start
+        cycles = 0
         notice_every = 30.0
         next_notice = start + notice_every
         last_state = "no SSH connection yet"
         if cycle_cmd:
             cycle_info = f"power-cycle command runs after {cycle_after:.0f}s"
         else:
-            cycle_info = "no JETSON_POWER_CYCLE_CMD set, a hung device must be reset manually"
+            cycle_info = "no TARGET_POWER_CYCLE_CMD set, a hung device must be reset manually"
         _say(f"Waiting for target to come back (timeout {float(timeout):.0f}s; {cycle_info})")
         while time.monotonic() < deadline:
             try:
@@ -477,11 +481,15 @@ class JetsonTarget:
                 logger.debug(f"waiting for target: {exc}")
                 self._drop_connection()
             now = time.monotonic()
-            if cycle_cmd and not cycled and now - start > cycle_after:
-                _say(f"Target did not return within {cycle_after:.0f}s, running power-cycle command", "WARN")
+            if cycle_cmd and now - last_cycle > cycle_after:
+                cycles += 1
+                _say(
+                    f"Target did not return within {now - start:.0f}s, running power-cycle command (#{cycles})",
+                    "WARN",
+                )
                 self.run_on_host(cycle_cmd, timeout=120, expected_rc="any")
-                cycled = True
-                next_notice = time.monotonic()
+                last_cycle = time.monotonic()
+                next_notice = last_cycle
             if now >= next_notice:
                 next_notice = now + notice_every
                 _say(
@@ -489,7 +497,7 @@ class JetsonTarget:
                     f"{max(deadline - now, 0):.0f}s left; {last_state}"
                 )
             time.sleep(5)
-        hint = "" if cycle_cmd else " (set JETSON_POWER_CYCLE_CMD to automate power-cycling a hung device)"
+        hint = "" if cycle_cmd else " (set TARGET_POWER_CYCLE_CMD to automate power-cycling a hung device)"
         _say(
             f"TIMEOUT: target did not come back within {float(timeout):.0f}s; last state: {last_state}{hint}",
             "WARN",

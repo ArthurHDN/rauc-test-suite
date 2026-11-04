@@ -15,7 +15,7 @@ AuditListener = []
 
 [variables]
 # Everything below can be overridden with  run_tests.py -v NAME:VALUE
-MACHINE = "jetson-orin-nano-devkit-nvme"
+# The device is selected with  run_tests.py --device NAME  (or DEVICE in .env), not here.
 BOOT_TIMEOUT = "900"
 INSTALL_TIMEOUT = "1800"
 SOAK_CYCLES = "6"
@@ -29,17 +29,17 @@ BOOT_FAILURE_ATTEMPTS = "5"
 # No reboot and no installation. Slot-change tests only toggle the bootloader's primary slot
 # temporarily and restore it; rejected-install tests must not modify any slot.
 [profiles.safe]
-exclude-tags = ["install", "reboot", "power-loss", "boot-failure", "soak"]
+excludes = ["install", "reboot", "power-loss", "boot-failure", "soak"]
 
 # Adds installation and reboot tests (sections 5, 6.4, 6.7, 6.8, 7.3, 7.6, 7.7).
 [profiles.update]
-exclude-tags = ["power-loss", "boot-failure", "soak"]
+excludes = ["power-loss", "boot-failure", "soak"]
 
 # Everything required by the acceptance criteria of RAUC-TEST-PLAN.md
-# (sections 1-5, TC-6.1 - TC-6.6). Needs JETSON_POWER_CYCLE_CMD for hung boots.
+# (sections 1-5, TC-6.1 - TC-6.6). Needs TARGET_POWER_CYCLE_CMD for hung boots.
 [profiles.acceptance]
-exclude-tags = ["soak"]
+excludes = ["soak"]
 
 # Acceptance plus the soak test (TC-7.1).
 [profiles.full]
-exclude-tags = []
+excludes = []

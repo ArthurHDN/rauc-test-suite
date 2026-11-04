@@ -29,10 +29,10 @@ TC-5.1 Bundle Verification On Target
 
 TC-5.2 Install To The Inactive Slot
     [Documentation]    Only the inactive slot is written and becomes the primary slot.
-    ${sums_before}=    Run On Target    sha256sum /etc/os-release /usr/bin/rauc /usr/sbin/nvbootctrl
+    ${sums_before}=    Get Unchanged Files Checksums
     ${inactive}=    Install To Inactive Slot And Check
     Should Be Equal    ${inactive}    ${SLOT_Y}
-    ${sums_after}=    Run On Target    sha256sum /etc/os-release /usr/bin/rauc /usr/sbin/nvbootctrl
+    ${sums_after}=    Get Unchanged Files Checksums
     Should Be Equal    ${sums_after.stdout}    ${sums_before.stdout}    Running system changed during the update
     ${rs}=    Get Rauc Status
     ${slot}=    Bootname To Rauc Slot    ${SLOT_Y}
@@ -40,24 +40,20 @@ TC-5.2 Install To The Inactive Slot
 
 TC-5.3 Reboot Into The New Slot
     Reboot And Verify Slot    ${SLOT_Y}
-    ${nv}=    Get Nvbootctrl Info
-    Should Be Equal    ${nv}[current]    ${SLOT_Y}
+    ${bl}=    Get Bootloader State
+    Should Be Equal    ${bl}[current]    ${SLOT_Y}
     IF    $NEW_BUILD_MARKER_CMD and $NEW_BUILD_MARKER_REGEX
         ${r}=    Run On Target    ${NEW_BUILD_MARKER_CMD}
         Should Match Regexp    ${r.stdout}    ${NEW_BUILD_MARKER_REGEX}    Marker of the new build not found
     END
 
 TC-5.4 Slot Marked Good After Successful Boot
-    [Documentation]    nv_update_verifier / rauc-mark-good confirm the new slot.
+    [Documentation]    The new slot is confirmed after the boot: RAUC reports it good and the bootloader
+    ...    recorded the successful boot (device plugin: nv_update_verifier on the Jetson, the restored
+    ...    boot attempt counter on the Raspberry Pi). Without it the slots would fail over eventually.
     Wait Until Slot Is Good    ${SLOT_Y}
-    # Without nv_update_verifier 'nvbootctrl verify' never runs and the bootloader retry counters
-    # are never cleared (slots fail over, eventually unbootable).
-    ${v}=    Run On Target    systemctl show nv_update_verifier.service -p LoadState -p Result -p ExecMainStatus
-    Should Contain    ${v.stdout}    LoadState=loaded    nv_update_verifier.service is not installed
-    Should Contain    ${v.stdout}    Result=success    nv_update_verifier.service did not succeed
-    Should Contain    ${v.stdout}    ExecMainStatus=0    nv_update_verifier.service exited non-zero
+    Boot Confirmation Should Be Recorded    ${SLOT_Y}
     Run On Target    systemctl status rauc-mark-good.service --no-pager    expected_rc=any
-    Run On Target    nvbootctrl dump-slots-info
     Boot Chain Should Be Healthy
     Run On Target    rauc status
     ${failed}=    Run On Target    systemctl --failed --no-legend --no-pager    expected_rc=any

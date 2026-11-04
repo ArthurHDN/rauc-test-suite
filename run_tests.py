@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Run the RAUC integration tests and keep an auditable, reproducible result directory.
 
+The tests are hardware independent; the device under test is selected with ``--device`` (or ``DEVICE`` in
+the environment / .env) and handled by a plugin in ``libraries/devices/`` (see DEVICES.md).
+
 Examples::
 
-    ./run_tests.py                                   # profile "safe", settings from .env, files from ./inputs
-    ./run_tests.py --profile update --inputs /path/to/qa-inputs
-    ./run_tests.py --profile update --bundle /path/to/other.raucb
+    ./run_tests.py --list-devices                    # supported devices
+    ./run_tests.py --device raspberrypi4-64          # profile "safe", settings from .env, files from ./inputs
+    ./run_tests.py --profile update --inputs /path/to/qa-inputs     # device from DEVICE in .env
+    ./run_tests.py --device jetson-orin-nano-devkit-nvme --profile update --bundle /path/to/other.raucb
     ./run_tests.py --host 192.168.1.50 --user root --ask-password
     ./run_tests.py --profile safe -- -t "TC-2.*"     # everything after -- goes to Robot Framework
     ./run_tests.py --dry-run                         # parse suites only, no device access
@@ -51,19 +55,21 @@ def _ensure_environment() -> None:
 _ensure_environment()
 sys.path.insert(0, str(ROOT / "libraries"))
 
-from audit_common import DEFAULT_ENV_FILE, write_sha256sums  # noqa: E402
+from audit_common import DEFAULT_ENV_FILE, env_file_path, write_sha256sums  # noqa: E402
 
-SECRET_KEYS = {"JETSON_PASSWORD", "JETSON_KEY_PASSPHRASE"}
+SECRET_KEYS = {"TARGET_PASSWORD", "TARGET_KEY_PASSPHRASE", "JETSON_PASSWORD", "JETSON_KEY_PASSPHRASE"}
 TAR_EXCLUDES = {".venv", "results", "inputs", ".env", "__pycache__", ".pytest_cache"}
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--env-file", help=f"settings file (default: {DEFAULT_ENV_FILE})")
-    p.add_argument("--host", help="target IP / hostname (JETSON_HOST)")
-    p.add_argument("--user", help="SSH user (JETSON_USER, default root)")
-    p.add_argument("--port", help="SSH port (JETSON_PORT, default 22)")
-    p.add_argument("--key-file", help="SSH private key (JETSON_KEY_FILE)")
+    p.add_argument("--device", help="device under test (DEVICE), see --list-devices; = Yocto MACHINE name")
+    p.add_argument("--list-devices", action="store_true", help="list the supported devices and exit")
+    p.add_argument("--host", help="target IP / hostname (TARGET_HOST)")
+    p.add_argument("--user", help="SSH user (TARGET_USER, default root)")
+    p.add_argument("--port", help="SSH port (TARGET_PORT, default 22)")
+    p.add_argument("--key-file", help="SSH private key (TARGET_KEY_FILE)")
     p.add_argument("--ask-password", action="store_true",
                    help="prompt for the SSH password (just press Enter for an empty password)")
     p.add_argument("--profile", default=None, help="robot.toml profile: safe (default), update, acceptance, full")
@@ -177,6 +183,7 @@ def write_result_sheet(run_dir: Path, tests: list[dict], manifest: dict) -> None
     lines = [
         f"# RAUC test result sheet - {manifest['run_id']}",
         "",
+        f"- Device: `{manifest['device'] or 'n/a'}`",
         f"- Target: `{t['user']}@{t['host']}:{t['port']}` (password {t['password']})",
         f"- Profile: `{manifest['profile']}`",
         f"- Started / finished (UTC): {manifest['started_utc']} / {manifest['finished_utc']}",
@@ -220,16 +227,18 @@ def write_reproduce(run_dir: Path, argv: list[str], manifest: dict) -> None:
     t = manifest["target"]
     text = f"""#!/usr/bin/env bash
 # Reproduce run {manifest['run_id']}.
-#  - Secrets are NOT stored. Export JETSON_PASSWORD (empty is fine) or add --ask-password.
-#  - Override JETSON_HOST / JETSON_USER to test another device (this run used {t['user']}@{t['host']}:{t['port']}).
+#  - Secrets are NOT stored. Export TARGET_PASSWORD (empty is fine) or add --ask-password.
+#  - Override TARGET_HOST / TARGET_USER to test another unit of the same device (this run used
+#    {t['user']}@{t['host']}:{t['port']}, device {manifest['device'] or 'n/a'}).
 #  - Test sources exactly as used: inputs/rauc-tests-sources.tar.gz (extract and set TESTS_DIR to it);
 #    git commit {git.get('commit', 'n/a')}{' (+ uncommitted changes in inputs/git-diff.patch)' if git.get('dirty') else ''}.
 #  - Input files (bundle, expected files, negative bundles) are taken from inputs/test-inputs/ when archived.
 set -euo pipefail
 RUN_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 TESTS_DIR="${{TESTS_DIR:-{ROOT}}}"
-export JETSON_HOST="${{JETSON_HOST:-{t['host']}}}"
-export JETSON_USER="${{JETSON_USER:-{t['user']}}}"
+export TARGET_HOST="${{TARGET_HOST:-{t['host']}}}"
+export TARGET_USER="${{TARGET_USER:-{t['user']}}}"
+export DEVICE="${{DEVICE:-{manifest['device'] or ''}}}"
 exec "${{PYTHON:-python3}}" "$TESTS_DIR/run_tests.py"{inputs_arg} {shlex.join(kept)}
 """
     p = run_dir / "reproduce.sh"
@@ -241,26 +250,45 @@ def main() -> int:
     ns = parse_args(sys.argv[1:])
     argv = sys.argv[1:]
 
+    from devices import list_devices
+
+    if ns.list_devices:
+        for name, description in list_devices():
+            print(f"{name:36} {description}")
+        return 0
+
     # ---- settings --------------------------------------------------------------------------
     if ns.env_file:
-        os.environ["JETSON_ENV_FILE"] = str(Path(ns.env_file).resolve())
-    for flag, var in (("host", "JETSON_HOST"), ("user", "JETSON_USER"), ("port", "JETSON_PORT"),
-                      ("key_file", "JETSON_KEY_FILE")):
+        os.environ["RAUC_TESTS_ENV_FILE"] = str(Path(ns.env_file).resolve())
+    if ns.device:
+        os.environ["DEVICE"] = ns.device
+    for flag, var in (("host", "TARGET_HOST"), ("user", "TARGET_USER"), ("port", "TARGET_PORT"),
+                      ("key_file", "TARGET_KEY_FILE")):
         if getattr(ns, flag) is not None:
             os.environ[var] = str(getattr(ns, flag))
     if ns.ask_password:
-        os.environ["JETSON_PASSWORD"] = getpass.getpass("SSH password (empty allowed): ")
+        os.environ["TARGET_PASSWORD"] = getpass.getpass("SSH password (empty allowed): ")
 
     from audit_common import get_setting
 
-    env_file = Path(os.environ.get("JETSON_ENV_FILE") or DEFAULT_ENV_FILE)
-    host = get_setting("JETSON_HOST")
-    if not host and not ns.dry_run:
-        print("error: JETSON_HOST is not set. Copy env.example to .env and edit it, or use --host.", file=sys.stderr)
+    env_file = env_file_path()
+    device = get_setting("DEVICE")
+    known = dict(list_devices())
+    if device and device not in known:
+        print(f"error: unknown device '{device}'. Supported: {', '.join(known)} (see --list-devices, DEVICES.md)",
+              file=sys.stderr)
         return 2
-    user = get_setting("JETSON_USER", "root") or "root"
-    port = get_setting("JETSON_PORT", "22") or "22"
-    pw = get_setting("JETSON_PASSWORD")
+    if not device and not ns.dry_run:
+        print("error: no device selected. Use --device <name> or set DEVICE in .env. Supported: "
+              + ", ".join(known), file=sys.stderr)
+        return 2
+    host = get_setting("TARGET_HOST")
+    if not host and not ns.dry_run:
+        print("error: TARGET_HOST is not set. Copy env.example to .env and edit it, or use --host.", file=sys.stderr)
+        return 2
+    user = get_setting("TARGET_USER", "root") or "root"
+    port = get_setting("TARGET_PORT", "22") or "22"
+    pw = get_setting("TARGET_PASSWORD")
     pw_state = "unset (empty password / key login)" if pw is None else ("empty" if pw == "" else "set")
 
     # ---- inputs ----------------------------------------------------------------------------
@@ -297,6 +325,8 @@ def main() -> int:
            "-b", "debug.log", "-x", "xunit.xml",
            "-v", f"BUNDLE_ARCHIVE_MODE:{ns.bundle_archive}",
            "-v", f"INPUTS_DIR:{inputs_dir}"]
+    if device:
+        cmd += ["-v", f"DEVICE:{device}"]
     if ns.bundle:
         cmd += ["-v", f"BUNDLE_PATH:{Path(ns.bundle).expanduser().resolve()}"]
     for var in ns.variable:
@@ -353,10 +383,11 @@ def main() -> int:
         "robot_exit_code": rc,
         "profile": profile,
         "dry_run": ns.dry_run,
+        "device": device or "",
         "command_line": [shlex.quote(a) for a in argv],
         "robot_command": shlex.join(cmd),
         "target": {"host": host or "n/a", "port": port, "user": user, "password": pw_state,
-                   "key_file": get_setting("JETSON_KEY_FILE", "") or ""},
+                   "key_file": get_setting("TARGET_KEY_FILE", "") or ""},
         "bundle": bundle_info,
         "inputs": inputs_manifest,
         "git": git,

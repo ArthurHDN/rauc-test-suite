@@ -1,399 +1,288 @@
-# RAUC Integration Test Plan – Jetson Orin Nano Devkit (NVMe)
+# RAUC Integration Test Plan
 
-Verifies the RAUC integration implemented in `internal/meta-jetson-rauc`:
+Hardware independent test plan for the RAUC integration of a device with a redundant (A/B) root filesystem.
+The test cases below describe *what* must hold on every device. Everything that differs between devices (boot
+loader, partition layout, tools used to inspect the A/B state) is listed in the
+[device appendix](#appendix-device-specifics) and implemented by one plugin per device
+(`libraries/devices/`, see [DEVICES.md](DEVICES.md)).
 
-| Item | Value |
-|---|---|
-| Machine / compatible | `jetson-orin-nano-devkit-nvme` (`RAUC_COMPATIBLE = ${MACHINE}`) |
-| Slots | `rootfs.0` → `/dev/disk/by-partlabel/APP` (bootname `A`), `rootfs.1` → `/dev/disk/by-partlabel/APP_b` (bootname `B`) |
-| Bootloader backend | `custom` → `/usr/libexec/rauc-nvbootctrl-backend` (wraps `nvbootctrl`) |
-| Bundle | `jetson-update-bundle`, format `verity`, plain bundles disabled |
-| Keyring | `/etc/rauc/ca.cert.pem`; bundle signed with the development key (`development-1.*.pem`) |
-| Flash layout | Redundant (`USE_REDUNDANT_FLASH_LAYOUT_DEFAULT = "1"`) |
+Supported devices (`./run_tests.py --list-devices`):
+
+| Device (= Yocto `MACHINE` = RAUC `compatible`) | Boot loader | Bundle recipe |
+|---|---|---|
+| `jetson-orin-nano-devkit-nvme` | UEFI + `nvbootctrl`, custom RAUC backend | `jetson-update-bundle` |
+| `jetson-orin-nano-devkit` (SD card) | UEFI + `nvbootctrl`, custom RAUC backend | `jetson-update-bundle` |
+| `raspberrypi4-64` | U-Boot, RAUC `uboot` backend | `update-bundle` |
 
 ## Conventions
 
-- Commands prefixed with `host$` run on the build host, `target#` on the Jetson (SSH or serial console, root login via `debug-tweaks`).
-- `<BUNDLE>` = `jetson-update-bundle-jetson-orin-nano-devkit-nvme.raucb` (found under `build/tmp-glibc-glibc/deploy/images/jetson-orin-nano-devkit-nvme/`).
-- Record the result of each test as PASS / FAIL in the [result sheet](#result-sheet).
-- Run tests in the given order; later tests depend on earlier state. Let the *initial* slot be `X` and the other slot `Y` (`X` is normally `A`).
+- Notation: `target#` = command on the device (SSH or serial console, root login), `host$` = command on the build host.
+- Let the *initial* slot be `X` and the other slot `Y` (`X` is normally `A`). `<BUNDLE>` is the `.raucb` under test.
+- **Bootloader state** is the A/B state as the boot loader sees it: slot states `normal`/`unbootable`, the *active*
+  slot (the one tried first = RAUC's primary slot) and the *current* slot (the one booted). How to read it per
+  device is in the appendix (`<BL-STATE>` below).
+- The automated suite runs the tests in the given order; later tests depend on earlier state.
+- Tests that do not apply to a device are skipped with a reason (see the appendix); they are not failures.
 
 ---
 
 ## 1. Installation and static configuration
 
 ### TC-1.1 RAUC packages installed
-**Description:** The image contains the RAUC client/service and the integration files.
+**Description:** The image contains the RAUC client/service and the integration files of the device.
 **Steps:**
 ```sh
 target# which rauc
 target# rauc --version
-target# ls -l /etc/rauc/system.conf /etc/rauc/ca.cert.pem /usr/libexec/rauc-nvbootctrl-backend
-target# which nvbootctrl
+target# ls -l /etc/rauc/system.conf /etc/rauc/ca.cert.pem
+target# <device specific files, see appendix>
 ```
 **Pass criteria:**
-- `rauc` is found and prints a version.
-- All three files exist; `rauc-nvbootctrl-backend` is executable (`-rwxr-xr-x`).
-- `nvbootctrl` exists at `/usr/sbin/nvbootctrl`.
+- `rauc` is found and prints a version; `system.conf` and `ca.cert.pem` exist.
+- The boot loader integration files and tools of the device exist (appendix).
 
 ### TC-1.2 system.conf contents
-**Description:** The `@RAUC_COMPATIBLE@` and `@DATA_MOUNT_POINT@` placeholders were substituted and the slot layout matches the design.
-**Steps:**
-```sh
-target# cat /etc/rauc/system.conf
-```
+**Description:** Build-time placeholders were substituted and the slot layout matches the design of the device.
+**Steps:** `target# cat /etc/rauc/system.conf`
 **Pass criteria:**
-- `compatible=jetson-orin-nano-devkit-nvme` (no `@RAUC_COMPATIBLE@` remains).
-- `bootloader=custom`, `bundle-formats=-plain`.
-- `data-directory=/data/rauc` (`DATA_MOUNT_POINT` substituted; no `@DATA_MOUNT_POINT@` remains).
-- If `expected/system.conf` is supplied, the file matches it after substituting both placeholders.
-- `bootloader-custom-backend=/usr/libexec/rauc-nvbootctrl-backend`.
-- `[slot.rootfs.0]` → `APP`, bootname `A`; `[slot.rootfs.1]` → `APP_b`, bootname `B`; both `type=ext4`.
+- `compatible=<device name>`, no placeholder (`@...@`) remains.
+- All keys of the device's expected `system.conf` (appendix) are present with the expected values; both rootfs slots
+  have the expected device, `bootname` `A`/`B` and `type=ext4`.
+- If `expected/system.conf` is supplied, the file matches it after substituting the placeholders.
 
 ### TC-1.3 Redundant partition layout
 **Description:** The device was flashed with the A/B layout, so both rootfs partitions exist.
-**Steps:**
-```sh
-target# ls -l /dev/disk/by-partlabel/
-target# lsblk -o NAME,PARTLABEL,SIZE,FSTYPE,MOUNTPOINT
-```
+**Steps:** `target# lsblk -o NAME,PARTLABEL,SIZE,FSTYPE,MOUNTPOINT`, `target# findmnt -no SOURCE /`
 **Pass criteria:**
-- `APP` and `APP_b` both exist, have equal size and are not mounted twice.
+- Both slot devices exist as block devices, have equal size and are not mounted twice.
 - Exactly one of them is mounted on `/`.
-- Redundant bootloader/firmware partitions exist as well. The secondary copy is named `B_<name>`, `<name>_b` or `<name>_alt` (e.g. `esp`/`esp_alt`, `recovery`/`recovery_alt`, `recovery-dtb`/`recovery-dtb_alt`).
+- Device specific layout rules hold (appendix), e.g. redundant firmware partitions on the Jetson, FAT boot partition on the Raspberry Pi.
 
 ### TC-1.4 Keyring / signing chain
 **Description:** The keyring on the target is the CA of the certificate that signed the bundle.
 **Steps:**
 ```sh
 target# openssl x509 -in /etc/rauc/ca.cert.pem -noout -subject -issuer -dates
-host$   openssl verify -CAfile internal/meta-jetson-rauc/recipes-core/rauc/files/ca.cert.pem \
-          internal/meta-jetson-rauc/recipes-core/bundles/files/development-1.cert.pem
+host$   openssl verify -CAfile <ca.cert.pem> <development-1.cert.pem>
 ```
-**Pass criteria:**
-- CA certificate is currently valid (not expired).
-- `openssl verify` reports `development-1.cert.pem: OK`.
+**Pass criteria:** the CA certificate is currently valid; `openssl verify` reports `OK` (when the inputs contain both certificates).
 
 ### TC-1.5 Data partition
-**Description:** The `DATA` partition fills the space left on the disk after the A/B layout and is mounted on `/data`.
-RAUC never writes to it, so it is shared by both slots and survives updates.
-**Steps:**
-```sh
-target# ls -l /dev/disk/by-partlabel/DATA
-target# lsblk -o NAME,PARTLABEL,SIZE,FSTYPE,MOUNTPOINT
-target# grep ' /data ' /proc/mounts
-target# touch /data/x && rm /data/x
-```
+**Description:** A persistent data partition is mounted on `/data`. RAUC never writes to it, so it is shared by both slots and survives updates.
+**Steps:** `target# grep ' /data ' /proc/mounts`, `target# touch /data/x && rm /data/x`
 **Pass criteria:**
-- `DATA` exists, is the largest partition and no space (beyond the secondary GPT/alignment) is left after it.
-- `/data` is mounted read-write, `ext4`, from the `DATA` partition.
-- A marker file written to `/data` before every reboot of the update tests is intact afterwards (checked by the
-  *Reboot And Verify Slot* keyword).
+- `/data` is mounted read-write, `ext4`, from the data partition of the device.
+- Device specific rules hold (appendix), e.g. the Jetson `DATA` partition is the largest one and fills the disk.
+- A marker file written to `/data` before every reboot of the update tests is intact afterwards (checked by the *Reboot And Verify Slot* keyword).
 
 ---
 
 ## 2. RAUC service and status
 
 ### TC-2.1 RAUC service running
-**Description:** The RAUC D-Bus service starts and is reachable.
-**Steps:**
-```sh
-target# systemctl status rauc.service
-target# systemctl is-enabled rauc.service
-target# journalctl -u rauc -b --no-pager | tail -n 30
-```
-**Pass criteria:**
-- Service is `active (running)` (or D-Bus activatable and starts on first `rauc status` call).
-- No errors about bootloader backend, keyring or `system.conf` in the log.
+**Steps:** `target# systemctl status rauc.service`, `target# journalctl -u rauc -b --no-pager | tail -n 30`
+**Pass criteria:** the service is active (or D-Bus activatable); no errors about the boot loader backend, keyring or `system.conf` in the log.
 
 ### TC-2.2 `rauc status` reports both slots
-**Description:** RAUC correctly maps both slots and the booted slot.
-**Steps:**
-```sh
-target# rauc status
-target# rauc status --output-format=json-pretty
-```
+**Steps:** `target# rauc status --output-format=json-pretty`
 **Pass criteria:**
-- `Compatible: jetson-orin-nano-devkit-nvme`, `Boot Slot` = `A` (or `B`, matching `nvbootctrl get-current-slot` 0/1).
-- `rootfs.0` (bootname `A`) and `rootfs.1` (bootname `B`) are listed, class `rootfs`, type `ext4`.
-- The booted slot has `state: booted`, `boot status: good`; the other slot is `inactive`.
-- `Activated:` shows the booted slot.
+- `Compatible` equals the device name; the boot slot equals the slot the boot loader reports as current.
+- `rootfs.0` (`A`) and `rootfs.1` (`B`) are listed, class `rootfs`, type `ext4`.
+- The booted slot is `booted` with boot status `good`; the other slot is `inactive`.
 
 ### TC-2.3 Booted slot matches the mounted rootfs
-**Description:** RAUC's view of the booted slot equals the real root device.
-**Steps:**
-```sh
-target# findmnt -no SOURCE /
-target# readlink -f /dev/disk/by-partlabel/APP /dev/disk/by-partlabel/APP_b
-target# nvbootctrl get-current-slot
-```
-**Pass criteria:**
-- Root source equals `APP` (slot `0`/`A`) or `APP_b` (slot `1`/`B`) according to `nvbootctrl get-current-slot`, and agrees with `rauc status`.
+**Steps:** `target# findmnt -no SOURCE /`, `target# readlink -f <slot devices>`
+**Pass criteria:** the root source is the device of the booted slot and agrees with `rauc status`.
+
+### TC-2.4 Kernel delivered with the rootfs
+**Description:** The kernel (and, where the boot loader reads it from the rootfs, the DTB) and the modules of the running
+kernel are in the booted rootfs, so a RAUC update replaces them together.
+**Steps / criteria:** device specific (appendix, "Boot files").
 
 ---
 
-## 3. Bootloader backend (`rauc-nvbootctrl-backend`)
+## 3. Bootloader interface
 
-Each command is executed directly to isolate the backend from RAUC. Use `BE=/usr/libexec/rauc-nvbootctrl-backend`.
+The interface RAUC uses to read and change the A/B state is exercised directly to isolate it from the install workflow
+(appendix: Jetson = `rauc-nvbootctrl-backend`, Raspberry Pi = `rauc status mark-*` and the U-Boot variables).
+Calls below: `GET-CURRENT`, `GET-PRIMARY`, `GET-STATE <slot>`, `SET-PRIMARY <slot>`, `SET-STATE <slot> good|bad`.
 
-### TC-3.1 `get-current`
-**Steps:** `target# $BE get-current; echo rc=$?`
-**Pass criteria:** Prints `A` or `B` matching the booted slot; `rc=0`.
+### TC-3.1 Get-current
+**Pass criteria:** prints the booted slot (`A`/`B`).
 
-### TC-3.2 `get-primary`
-**Steps:** `target# $BE get-primary; echo rc=$?; nvbootctrl dump-slots-info`
-**Pass criteria:** Prints the slot shown as `Active bootloader slot` in `dump-slots-info`; `rc=0`.
+### TC-3.2 Get-primary
+**Pass criteria:** prints the slot the boot loader tries first (`<BL-STATE>` active slot).
 
-### TC-3.3 `get-state`
-**Steps:**
-```sh
-target# $BE get-state A; $BE get-state B
-target# nvbootctrl dump-slots-info
-```
-**Pass criteria:**
-- Prints `good` for slots with `status: normal`, otherwise `bad`.
-- Right after a healthy boot both slots are normally `good`.
+### TC-3.3 Get-state
+**Pass criteria:** `good` for slots the boot loader reports `normal`, otherwise `bad`; right after a healthy boot both are `good`.
 
-### TC-3.4 `set-primary` (round trip)
-**Description:** Primary slot can be switched and restored.
-**Steps:**
-```sh
-target# $BE set-primary Y; $BE get-primary      # Y = inactive slot name
-target# nvbootctrl dump-slots-info              # Active bootloader slot -> Y
-target# $BE set-primary X; $BE get-primary      # restore
-```
-**Pass criteria:** `get-primary` returns the slot just set each time; `rc=0`; `nvbootctrl` agrees. State is restored to `X` at the end.
+### TC-3.4 Set-primary (round trip)
+**Steps:** `SET-PRIMARY Y`, `GET-PRIMARY`, `SET-PRIMARY X`, `GET-PRIMARY`.
+**Pass criteria:** `GET-PRIMARY` returns the slot just set each time; `<BL-STATE>` agrees; state is restored to `X`.
 
-### TC-3.5 `set-state good` on the running slot
-**Steps:** `target# $BE set-state X good; echo rc=$?; $BE get-state X`
-**Pass criteria:** `rc=0` and `get-state X` returns `good`.
+### TC-3.5 Set-state good on the running slot
+**Pass criteria:** exit code 0 and `GET-STATE X` returns `good`.
 
-### TC-3.6 `set-state good` on the non-running slot is a no-op
-**Steps:** `target# $BE set-state Y good; echo rc=$?; nvbootctrl dump-slots-info`
-**Pass criteria:** `rc=0`; status of slot `Y` is not altered (design: only the running slot can be verified).
+### TC-3.6 Set-state good on the non-running slot is a no-op
+**Applies to:** devices whose interface ignores `good` for the non-running slot (Jetson). **Skipped** otherwise (appendix).
+**Pass criteria:** exit code 0; slot `Y` and the active slot are not altered.
 
-### TC-3.7 `set-state bad` redirects boot to the other slot
-**Description:** Marking the *active* slot bad switches the active slot to the other one.
-**Steps:**
-```sh
-target# $BE get-primary                # expect X
-target# $BE set-state X bad; echo rc=$?
-target# $BE get-primary                # expect Y
-target# $BE set-primary X              # restore
-```
-**Pass criteria:** After `set-state X bad`, primary is `Y`. After restore, primary is `X`.
+### TC-3.7 Set-state bad redirects boot to the other slot
+**Steps:** `SET-PRIMARY X`, `SET-STATE X bad`, `GET-PRIMARY`, `SET-PRIMARY X`.
+**Pass criteria:** after the bad call the primary is `Y`; after the restore it is `X`.
 
 ### TC-3.8 Invalid input handling
-**Steps:**
-```sh
-target# $BE get-state C; echo rc=$?
-target# $BE set-primary Z; echo rc=$?
-target# $BE set-state A maybe; echo rc=$?
-target# $BE; echo rc=$?
-```
-**Pass criteria:** Every call returns a non-zero exit code; the last prints the usage text on stderr; no `nvbootctrl` state changes.
+**Pass criteria:** every invalid request (unknown slot, unknown state, ...; appendix) fails with a non-zero exit code;
+where the interface has a stand-alone command, calling it without arguments prints the usage text; the boot loader state is unchanged.
 
 ---
 
-## 4. Bundle build and inspection (build host)
+## 4. Bundle inspection
 
-### TC-4.1 Bundle builds
-**Steps:**
-```sh
-host$ kas build kas/jetson-orin-nano.yml --target jetson-update-bundle
-host$ ls -lh build/tmp-glibc-glibc/deploy/images/jetson-orin-nano-devkit-nvme/*.raucb
-```
-**Pass criteria:** Build finishes without errors; a `.raucb` file exists with a size comparable to the compressed rootfs (non-zero, hundreds of MB).
+### TC-4.1 Input files verified
+**Pass criteria:** the files in the inputs directory match the SHA-256 sums of `inputs.json`.
 
 ### TC-4.2 Bundle metadata
-**Steps:**
-```sh
-host$ rauc info --keyring=internal/meta-jetson-rauc/recipes-core/rauc/files/ca.cert.pem <BUNDLE>
-```
-**Pass criteria:**
-- `Compatible: jetson-orin-nano-devkit-nvme`.
-- `Bundle Format: verity`.
-- Exactly one image: slot class `rootfs`, filename `core-image-minimal-*.ext4`, with a SHA-256 checksum.
-- Signature chain verified (`Certificate Chain` shows development cert signed by the CA).
+**Steps:** `rauc info --keyring=<ca.cert.pem> <BUNDLE>` (runs on the target)
+**Pass criteria:** `Compatible` equals the device name; format `verity`; exactly one image (slot class `rootfs`) with a SHA-256 checksum; signature chain verified.
 
 ### TC-4.3 Bundle uses the matching rootfs
-**Description:** The bundled rootfs corresponds to the image that is currently flashed (same build or intentionally newer).
-**Steps:** Compare the `/etc/os-release`/build timestamp of the image with the bundle’s rootfs (`rauc extract` + mount, or `rauc info` version/build fields).
-**Pass criteria:** Bundle content is from the expected build; version difference is identifiable (needed to confirm the update in section 5).
+**Pass criteria:** the bundled image matches `expected/rootfs.sha256` (when supplied).
 
 ---
 
-## 5. Update installation (A → B)
-
-Preparation: copy the bundle to the target, optionally after making an identifiable change in the new build (e.g. changed `/etc/issue` or version string), so a successful update is visible.
-
-```sh
-host$   scp <BUNDLE> root@<target-ip>:/tmp/
-target# df -h /tmp          # enough space for the bundle
-```
+## 5. Update installation (X → Y)
 
 ### TC-5.1 Bundle verification on target
-**Steps:** `target# rauc info /tmp/<BUNDLE>`
-**Pass criteria:** Signature verified against `/etc/rauc/ca.cert.pem`; compatible matches; no errors.
+**Steps:** `target# rauc info <BUNDLE>`
+**Pass criteria:** signature verified against `/etc/rauc/ca.cert.pem`; compatible matches; no errors.
 
 ### TC-5.2 Install to the inactive slot
-**Steps:**
-```sh
-target# rauc install /tmp/<BUNDLE>
-```
+**Steps:** `target# rauc install <BUNDLE>`
 **Pass criteria:**
-- Progress reaches 100 %; final message `installing ... succeeded`; exit code `0`.
-- Only the **inactive** slot (`Y`) is written; the running slot is untouched (compare `md5sum` of a few files or check that the system keeps running normally).
-- `rauc status` afterwards shows `Y` as primary/activated, boot status `good` (or pending) as designed, and `X` still `booted`.
-- `nvbootctrl dump-slots-info`: `Active bootloader slot` = `Y`, `Current bootloader slot` = `X`.
+- Progress reaches 100 %, final message `installing ... succeeded`, exit code 0.
+- Only the inactive slot `Y` is written: the checksums of the running system's files (`/etc/os-release`, `/usr/bin/rauc`, plus the device's list) are unchanged.
+- `rauc status`: `Y` is primary, `X` still `booted`; `<BL-STATE>`: active = `Y`, current = `X`.
 
 ### TC-5.3 Reboot into the new slot
-**Steps:**
-```sh
-target# reboot
-# after boot:
-target# rauc status
-target# nvbootctrl get-current-slot
-target# findmnt -no SOURCE /
-```
-**Pass criteria:**
-- System boots to a login prompt/SSH without manual intervention.
-- Booted slot is now `Y`; root device is the partition of `Y`.
-- The identifiable change from the new build is present.
+**Pass criteria:** the device boots without manual intervention, booted slot and root device are `Y`, `<BL-STATE>` current = `Y`, the data marker is intact, and (optionally, `NEW_BUILD_MARKER_*`) the new build is present.
 
 ### TC-5.4 Slot marked good after successful boot
-**Description:** `nv_update_verifier` / `rauc-mark-good` confirm the new slot.
-**Steps:**
-```sh
-target# systemctl status nv_update_verifier.service
-target# systemctl status rauc-mark-good.service     # if present in the image
-target# nvbootctrl dump-slots-info
-target# rauc status
-```
-**Pass criteria:** After boot, slot `Y` has `status: normal` and RAUC shows boot status `good`. No services failed related to rauc/nv-update-verifier.
+**Description:** the new slot is confirmed after the boot. The boot loader records the successful boot (appendix) and RAUC reports `good`.
+**Pass criteria:** RAUC boot status `good`; the boot confirmation of the device is recorded; no failed RAUC related units; no unbootable slot.
 
-### TC-5.5 Second update back to the original slot (B → A)
-**Steps:** Repeat TC-5.2 – TC-5.4 with the bundle.
-**Pass criteria:** Update lands in `X`, the system boots from `X`, and slot `X` is `good`. Proves the mechanism works in both directions.
+### TC-5.5 Second update back to the original slot (Y → X)
+**Pass criteria:** the update lands in `X`, the system boots from `X` and `X` is `good`.
 
-### TC-5.6 Persistence across update (if applicable)
-**Description:** Data outside the rootfs is not affected by an update (note: with this minimal setup there is no separate data partition; the rootfs is replaced entirely).
-**Steps:** Before update, create `/tmp` and `/root/testfile` markers; after update check them.
-**Pass criteria:** Documented behavior is observed – files in `/root` are **lost** on the rootfs (expected for the current layout, unless a data partition/overlay is added). Mark N/A if a persistent partition is added.
+### TC-5.6 Persistence across update
+**Pass criteria:** the data marker in `/data` survives every update. Files in the rootfs are replaced (expected). N/A if the device has no data partition.
 
 ---
 
 ## 6. Failure handling and rollback
 
-### TC-6.1 Reject an unsigned / wrongly signed bundle
-**Steps:**
-```sh
-host$   # build or re-sign a bundle with a different key/cert
-host$   rauc bundle --cert=other.cert.pem --key=other.key.pem <input-dir> bad.raucb
-target# rauc install /tmp/bad.raucb
-```
-**Pass criteria:** Installation is refused with a signature/keyring verification error; neither slot is modified; active slot unchanged.
+### TC-6.1 Reject a wrongly signed bundle
+**Pass criteria:** refused with a signature/keyring error; neither slot is modified and the boot configuration is unchanged.
 
 ### TC-6.2 Reject a bundle with wrong compatible string
-**Steps:** Create a bundle whose `compatible` is `other-machine` (signed with the dev key), install it.
-**Pass criteria:** Installation is refused (`Compatible mismatch`); slots unchanged.
+**Pass criteria:** refused (`Compatible mismatch`); slots and boot configuration unchanged.
 
 ### TC-6.3 Reject a plain-format bundle
-**Description:** `bundle-formats=-plain` prevents the legacy format.
-**Steps:** Install a bundle created with `format=plain`.
-**Pass criteria:** Installation is refused due to disallowed bundle format.
+**Applies to:** devices whose `system.conf` sets `bundle-formats=-plain`; **skipped** otherwise (the check is made on the device).
+**Pass criteria:** refused (`Bundle format 'plain' not allowed`); nothing modified.
 
 ### TC-6.4 Corrupted bundle
-**Steps:**
-```sh
-target# cp /tmp/<BUNDLE> /tmp/corrupt.raucb
-target# dd if=/dev/urandom of=/tmp/corrupt.raucb bs=1M seek=10 count=1 conv=notrunc
-target# rauc install /tmp/corrupt.raucb
-```
-**Pass criteria:** Install fails with a verity/hash/signature error; the inactive slot is not marked as bootable/activated; the running system stays unchanged.
+**Pass criteria:** the install fails with a verity/hash/signature error; the active slot and the boot order are unchanged.
+The inactive slot may be left partially written (and flagged bad by the U-Boot backend), so its status is not compared.
 
 ### TC-6.5 Power loss during installation
-**Description:** Interrupting the write does not brick the device.
-**Steps:** Start `rauc install`, and after ~30–50 % progress cut power (or `echo b > /proc/sysrq-trigger`).
-**Pass criteria:** Device boots again into the **previous** (still valid) slot `X`; `rauc status` shows `X` booted and good; a subsequent install succeeds.
+**Steps:** start `rauc install`, cut power (`sysrq` reset) at `POWER_LOSS_PERCENT` progress.
+**Pass criteria:** the device boots the previous slot `X`, `X` is good, the interrupted install did not activate `Y`, a subsequent install succeeds.
 
 ### TC-6.6 Boot failure triggers fallback
-**Description:** A new slot that fails to boot is not retried forever; the bootloader falls back to the old slot.
-**Steps:**
-1. Install a deliberately broken bundle (e.g. rootfs with a broken `/sbin/init` or kernel panic via `init=/bin/false` change) into `Y`.
-2. Reboot and let the device attempt booting (power-cycle if it hangs).
-3. Observe over several boots; check `nvbootctrl dump-slots-info` from the recovered slot.
+**Steps:** install a bundle whose rootfs cannot boot, reboot, power-cycle if the device hangs (`TARGET_POWER_CYCLE_CMD`), repeat until the boot loader gives up on `Y`.
 **Pass criteria:**
-- After the Jetson's retry counter is exhausted, it boots slot `X` again (retry/fall-back behavior of the UEFI boot chain).
-- `rauc status` from `X` shows `Y` as `bad`/not good.
-- Device is not stuck permanently.
-
-> Note: `set-state bad` cannot mark a slot unbootable from user space (see backend comment). The fallback relies on the NVIDIA boot chain retry counters, which is what this test validates.
+- The device returns to slot `X`; the broken slot `Y` ends up flagged `unbootable` in the boot loader state (immediately on the Jetson, after the boot attempts are used up on devices that count them) and RAUC does not report it `good`.
+- The device is not stuck permanently. The slot is re-installed by the teardown.
 
 ### TC-6.7 Mark-bad path via RAUC
-**Steps:**
-```sh
-target# rauc status mark-bad            # marks the booted slot bad
-target# nvbootctrl dump-slots-info
-target# reboot
-target# rauc status
-```
-**Pass criteria:** After `mark-bad`, the active slot is the other slot. After reboot, the device boots from the other slot. Afterwards restore with `rauc status mark-active <slot>` and verify.
+**Steps:** `rauc status mark-bad`, `<BL-STATE>`, reboot, `rauc status mark-active <X>`.
+**Pass criteria:** after `mark-bad` the active slot is the other one; the device boots from it; the restore works.
 
 ### TC-6.8 Manual slot switching through RAUC
-**Steps:**
-```sh
-target# rauc status mark-active other
-target# nvbootctrl dump-slots-info
-target# reboot
-target# rauc status mark-active booted   # restore on the other side as required
-```
-**Pass criteria:** Reboot enters the other slot; `rauc status` matches; no data corruption.
+**Steps:** `rauc status mark-active other`, reboot, switch back.
+**Pass criteria:** the reboot enters the other slot; `rauc status` matches.
 
 ---
 
 ## 7. Robustness and system integration
 
 ### TC-7.1 Repeated update cycles (soak)
-**Steps:** Perform at least 5 alternating updates (A→B→A→B→A→B), rebooting each time and checking `rauc status`.
-**Pass criteria:** Every cycle succeeds; slot always flips; no filesystem errors in `dmesg`; no leftover mounts of the inactive slot.
+**Pass criteria:** at least `SOAK_CYCLES` (6) alternating updates; every cycle succeeds, the slot flips, no filesystem errors in `dmesg`, no mount of the inactive slot.
 
 ### TC-7.2 Filesystem health of both slots
-**Steps:**
-```sh
-target# dmesg | grep -iE 'ext4|i/o error|nvme' | tail
-target# e2fsck -fn /dev/disk/by-partlabel/<inactive>     # read-only check on the inactive slot
-```
-**Pass criteria:** No EXT4 or NVMe I/O errors; `e2fsck` of the freshly written slot reports clean.
+**Pass criteria:** no filesystem/storage errors in the kernel log (patterns per device); `e2fsck -fn` of the inactive slot is clean (if installed).
 
 ### TC-7.3 Rootfs content identical to bundle image
-**Steps:** After the update, compare the hash of the inactive-slot image written by RAUC with the image in the bundle:
-```sh
-host$   sha256sum <extracted core-image-minimal.ext4>
-target# sha256sum /dev/disk/by-partlabel/<slot-written>   # compare only the first <image size> bytes (e.g. head -c <size> | sha256sum)
-```
-**Pass criteria:** Checksums match for the image-size range.
+**Pass criteria:** the first `<image size>` bytes of the written slot have the SHA-256 listed in the bundle.
 
 ### TC-7.4 Bootloader slot state consistency
-**Steps:** After each update/reboot run `nvbootctrl dump-slots-info` and `rauc status`.
-**Pass criteria:** `Current bootloader slot` = RAUC's booted slot; `Active bootloader slot` = RAUC's primary slot; no `unbootable` slot after a healthy update.
+**Pass criteria:** `<BL-STATE>` current = RAUC booted slot, active = RAUC primary slot, no `unbootable` slot.
 
-### TC-7.5 No service regressions after update
-**Steps:**
-```sh
-target# systemctl --failed
-target# journalctl -b -p err --no-pager
-target# ip a; ssh into the target
-```
-**Pass criteria:** No failed units; networking (including `r8168` NIC) and SSH work; no RAUC-related errors.
+### TC-7.5 No service regressions
+**Pass criteria:** no failed units; no RAUC related errors in the journal; a global IP address is configured; the NIC driver of the device is loaded (warning only).
 
 ### TC-7.6 Concurrent install protection
-**Steps:** Start `rauc install` and, in a second shell, start another `rauc install`.
-**Pass criteria:** The second call is rejected with "Installation already in progress"/busy message; first one completes normally.
+**Pass criteria:** a second `rauc install` is rejected (busy / already in progress); the first one completes.
 
 ### TC-7.7 Installing the same bundle again
-**Steps:** Re-install the bundle currently running (same version).
-**Pass criteria:** Installation succeeds and writes into the inactive slot (or is skipped when `install-check` hooks are added); system stays bootable. Record the observed behavior.
+**Pass criteria:** the install succeeds into the inactive slot and the system stays bootable; the behaviour is recorded.
+
+---
+
+## Appendix: device specifics
+
+The values below are implemented in `libraries/devices/<device>.py`; the plugin is the source of truth.
+
+### Jetson Orin Nano devkit (`jetson-orin-nano-devkit-nvme`, `jetson-orin-nano-devkit`)
+
+| Item | Value |
+|---|---|
+| Layer | `internal/meta-rauc-tegra-jetson-orin-nano` (kas: `kas/jetson-orin-nano.yml`, `kas/jetson-orin-nano-sd.yml`) |
+| `system.conf` | `bootloader=custom`, `bundle-formats=-plain`, `data-directory=/data/rauc`, `bootloader-custom-backend=/usr/libexec/rauc-nvbootctrl-backend` |
+| Slots | `/dev/disk/by-partlabel/APP` (`A`), `/dev/disk/by-partlabel/APP_b` (`B`); data: `DATA` |
+| `<BL-STATE>` | `nvbootctrl dump-slots-info` (bootloader chain) merged with `nvbootctrl -t rootfs dump-slots-info` (a slot unbootable in either chain is unbootable) |
+| Files (TC-1.1) | `rauc-nvbootctrl-backend` executable (`-rwxr-xr-x`), `/usr/sbin/nvbootctrl` |
+| Layout (TC-1.3, 1.5) | redundant firmware partitions (`B_<name>`, `<name>_b`, `<name>_alt`; NVMe variant: failure, SD variant: warning, firmware may live in QSPI); `DATA` largest, nothing unused after it |
+| Boot files (TC-2.4) | `extlinux.conf` boots `/boot/Image` and has an `FDT` line; kernel, DTB and modules are in the rootfs |
+| Interface (TC-3) | `rauc-nvbootctrl-backend get-current / get-primary / get-state / set-primary / set-state`; invalid: `get-state C`, `set-primary Z`, `set-state A maybe`; without arguments: usage text |
+| Boot confirmation (TC-5.4) | `nv_update_verifier.service` succeeded; no unbootable slot in either chain |
+| TC-3.6 | applies (only the running slot can be verified) |
+| TC-6.3 | applies (`-plain`) |
+| TC-6.6 | a failed rootfs is flagged only in the rootfs chain (UEFI variables `RootfsStatusSlotA/B`) and the flag survives re-installs; the test resets it (`efivar`) |
+| Kernel errors (TC-7.2) | NVMe variant: `EXT4-fs error`, `I/O error`, `nvme*` timeouts; SD variant: `mmcblk*` instead |
+| NIC (TC-7.5) | `r8168`/`r8169` |
+
+### Raspberry Pi 4 (`raspberrypi4-64`)
+
+| Item | Value |
+|---|---|
+| Layers | `meta-rauc-community/meta-rauc-raspberrypi` + `meta-lts-mixins` (`scarthgap/u-boot`), kas: `kas/rpi4.yml`, bundle `update-bundle` |
+| `system.conf` | `bootloader=uboot`, `data-directory=/data/`, `[keyring] path=/etc/rauc/ca.cert.pem`; no `bundle-formats` |
+| Slots | `/dev/mmcblk0p2` (`A`), `/dev/mmcblk0p3` (`B`); `/boot` = FAT `mmcblk0p1`; data: `mmcblk0p5` (no partition labels on the MBR table) |
+| `<BL-STATE>` | `fw_printenv`: `BOOT_ORDER` (slots in order), `BOOT_A_LEFT` / `BOOT_B_LEFT` (remaining boot attempts, hexadecimal). A slot is `normal` when it is in `BOOT_ORDER` and has attempts left; the active slot is the first such slot; the current slot is `rauc.slot=` on the kernel command line |
+| Files (TC-1.1) | `fw_printenv`, `fw_setenv`, `/etc/fw_env.config`, `/boot/uboot.env`, `rauc.slot=` on the command line |
+| Layout (TC-1.3, 1.5) | `/boot` is the vfat partition `mmcblk0p1`; data on `mmcblk0p5` |
+| Boot files (TC-2.4) | U-Boot loads `/boot/Image` from the booted rootfs. The FAT `/boot` hides it, so the check bind mounts `/` and looks at that copy. The **DTB comes from the firmware on the boot partition and is not part of the update** |
+| Interface (TC-3) | RAUC's own U-Boot backend through `rauc status mark-active/mark-good/mark-bad <slot>` and `rauc status` (no stand-alone command: the usage check is not applicable); invalid: unknown slot or unknown `mark-*` verb |
+| Boot confirmation (TC-5.4) | `rauc-mark-good.service` restored `BOOT_<slot>_LEFT` to 3 |
+| TC-3.6 | **skipped**: the U-Boot backend restores the attempt counter of any slot on `mark-good`, so there is no no-op |
+| TC-6.3 | **skipped** unless `bundle-formats` of `system.conf` excludes `plain` (not set in the stock community `system.conf`) |
+| TC-6.4 | slot status not compared: RAUC marks the slot it is about to write as bad (removed from `BOOT_ORDER`, attempts 0) |
+| TC-6.6 | a broken boot hangs in U-Boot (`boot.scr` never resets when the kernel cannot be loaded): set `TARGET_POWER_CYCLE_CMD`. `boot.scr` decrements `BOOT_<slot>_LEFT` at every try, so a broken slot costs the reboot plus 2 power cycles (the 3 tries); the 3rd power cycle boots the other slot. The test repeats until the slot is `unbootable` |
+| Teardowns | the inactive slot is re-added to `BOOT_ORDER` with full attempts (U-Boot environment variables), the primary is restored |
+| Kernel errors (TC-7.2) | `EXT4-fs error`, `I/O error`, `mmcblk*` timeouts/errors |
+| NIC (TC-7.5) | not checked |
 
 ---
 
@@ -409,22 +298,23 @@ target# ip a; ssh into the target
 | TC-2.1 | RAUC service running | | |
 | TC-2.2 | `rauc status` both slots | | |
 | TC-2.3 | Booted slot matches rootfs | | |
-| TC-3.1 | Backend `get-current` | | |
-| TC-3.2 | Backend `get-primary` | | |
-| TC-3.3 | Backend `get-state` | | |
-| TC-3.4 | Backend `set-primary` | | |
-| TC-3.5 | Backend `set-state good` (running) | | |
-| TC-3.6 | Backend `set-state good` (other) | | |
-| TC-3.7 | Backend `set-state bad` | | |
-| TC-3.8 | Backend invalid input | | |
-| TC-4.1 | Bundle builds | | |
+| TC-2.4 | Kernel delivered with the rootfs | | |
+| TC-3.1 | Interface get-current | | |
+| TC-3.2 | Interface get-primary | | |
+| TC-3.3 | Interface get-state | | |
+| TC-3.4 | Interface set-primary | | |
+| TC-3.5 | Interface set-state good (running) | | |
+| TC-3.6 | Interface set-state good (other) | | |
+| TC-3.7 | Interface set-state bad | | |
+| TC-3.8 | Interface invalid input | | |
+| TC-4.1 | Input files verified | | |
 | TC-4.2 | Bundle metadata | | |
 | TC-4.3 | Bundle uses matching rootfs | | |
 | TC-5.1 | Bundle verification on target | | |
 | TC-5.2 | Install to inactive slot | | |
 | TC-5.3 | Reboot into new slot | | |
 | TC-5.4 | Slot marked good | | |
-| TC-5.5 | Update back (B → A) | | |
+| TC-5.5 | Update back | | |
 | TC-5.6 | Persistence across update | | |
 | TC-6.1 | Reject wrongly signed bundle | | |
 | TC-6.2 | Reject wrong compatible | | |
@@ -442,4 +332,6 @@ target# ip a; ssh into the target
 | TC-7.6 | Concurrent install protection | | |
 | TC-7.7 | Re-install same bundle | | |
 
-**Overall acceptance:** The integration is considered successful when all tests in sections 1–5 pass, TC-6.1 – TC-6.5 pass, and TC-6.6 demonstrates a fallback to the previous slot. Any FAIL must be recorded with logs (`journalctl -u rauc`, `nvbootctrl dump-slots-info`, serial console output).
+**Overall acceptance:** the integration is successful when all tests in sections 1-5 pass, TC-6.1 - TC-6.5 pass (skips
+listed in the appendix excepted), and TC-6.6 demonstrates a fallback to the previous slot. Any FAIL must be recorded
+with logs (`journalctl -u rauc`, the `<BL-STATE>` output, serial console output).

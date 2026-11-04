@@ -29,7 +29,7 @@ TC-2.2 Rauc Status Reports Both Slots
     ${booted}=    Get Booted Bootname
     ${other}=    Other Bootname    ${booted}
     Should Be Equal    ${rs}[compatible]    ${MACHINE}
-    Should Be Equal    ${rs}[booted_bootname]    ${booted}    RAUC booted slot differs from nvbootctrl
+    Should Be Equal    ${rs}[booted_bootname]    ${booted}    RAUC booted slot differs from the booted slot reported by the device
     FOR    ${name}    ${bootname}    IN    rootfs.0    A    rootfs.1    B
         Should Be Equal    ${rs}[slots][${name}][bootname]    ${bootname}
         Should Be Equal    ${rs}[slots][${name}][class]    rootfs
@@ -45,14 +45,17 @@ TC-2.2 Rauc Status Reports Both Slots
 TC-2.3 Booted Slot Matches Mounted Rootfs
     [Documentation]    RAUC's view of the booted slot equals the real root device.
     Run On Target    findmnt -no SOURCE /    expected_rc=any
-    Run On Target    readlink -f /dev/disk/by-partlabel/APP
-    Run On Target    readlink -f /dev/disk/by-partlabel/APP_b
+    ${dev_a}=    Get Slot Device    A
+    ${dev_b}=    Get Slot Device    B
+    Run On Target    readlink -f ${dev_a}
+    Run On Target    readlink -f ${dev_b}
     ${booted}=    Get Booted Bootname
     Root Should Be Slot    ${booted}
     ${rs}=    Get Rauc Status
     Should Be Equal    ${rs}[booted_bootname]    ${booted}
 
-TC-2.4 Kernel And DTB Delivered With The Rootfs
-    [Documentation]    /boot/Image, the DTB (extlinux.conf FDT line) and the modules of the running kernel
-    ...    are in the booted rootfs, so a RAUC update replaces kernel, DTB and modules together.
+TC-2.4 Kernel Delivered With The Rootfs
+    [Documentation]    The kernel (and, where the bootloader loads it from the rootfs, the DTB) and the modules of
+    ...    the running kernel are in the booted rootfs, so a RAUC update replaces them together. What is
+    ...    checked exactly is defined by the device plugin (check_boot_files).
     Boot Files Should Match Running Kernel

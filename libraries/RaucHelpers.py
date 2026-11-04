@@ -1,4 +1,4 @@
-"""Pure-Python parsing helpers for RAUC / nvbootctrl output (no I/O to the target)."""
+"""Pure-Python parsing helpers for RAUC output (no I/O to the target, no device knowledge)."""
 
 from __future__ import annotations
 
@@ -12,10 +12,6 @@ _BOOTNAMES = ("A", "B")
 # ------------------------------------------------------------------ slot names
 def other_bootname(bootname: str) -> str:
     return {"A": "B", "B": "A"}[_check_bootname(bootname)]
-
-
-def bootname_to_partlabel(bootname: str) -> str:
-    return {"A": "APP", "B": "APP_b"}[_check_bootname(bootname)]
 
 
 def bootname_to_index(bootname: str) -> int:
@@ -43,24 +39,6 @@ def parse_ini(text: str) -> dict[str, dict[str, str]]:
     cp.optionxform = str  # keep key case
     cp.read_string(text)
     return {section: dict(cp.items(section)) for section in cp.sections()}
-
-
-def parse_nvbootctrl_slots(text: str) -> dict:
-    """Parse ``nvbootctrl dump-slots-info``.
-
-    Returns ``{current: 'A', active: 'A', slots: {'A': 'normal', 'B': 'normal'}}``.
-    """
-    cur = re.search(r"Current (?:bootloader|rootfs) slot:\s*([AB])", text)
-    act = re.search(r"Active (?:bootloader|rootfs) slot:\s*([AB])", text)
-    # Rootfs output may contain 'retry_count: N,' between slot and status.
-    by_index = {int(i): s for i, s in re.findall(r"^slot:\s*(\d+),(?:\s*retry_count:\s*\d+,)?\s*status:\s*(\w+)", text, re.M)}
-    if not cur or not act or not by_index:
-        raise AssertionError(f"Unexpected 'nvbootctrl dump-slots-info' output:\n{text}")
-    return {
-        "current": cur.group(1),
-        "active": act.group(1),
-        "slots": {"A": by_index.get(0), "B": by_index.get(1)},
-    }
 
 
 def parse_rauc_status(text: str) -> dict:
