@@ -1,8 +1,12 @@
 # RAUC integration tests
 
-Automated Robot Framework implementation of `RAUC-TEST-PLAN.md` (in this folder, so it is part of the QA
+Automated Robot Framework implementation of `RAUC-TEST-PLAN.md` (in this repository, so it is part of the QA
 package). Every test case `TC-x.y` of the plan is one Robot test; the target is reached over SSH. Every run is
 stored in its own directory so each result can be audited and reproduced.
+
+This is a standalone repository. It can be cloned anywhere (it is usually checked out next to, or inside, the Yocto
+image repository, but it does not have to be) and is run from its own root directory. It has no dependency on the
+image repository, its layout or its tools; the only coupling is the inputs directory (see below).
 
 The tests are hardware independent. Everything that differs between devices (boot loader, partition layout, how
 the A/B state is read) lives in one plugin per device under `libraries/devices/`. Supported devices
@@ -15,14 +19,16 @@ the A/B state is read) lives in one plugin per device under `libraries/devices/`
 | `raspberrypi4-64` | Raspberry Pi 4 (U-Boot) |
 
 Device specifics and skipped tests are listed in the appendix of `RAUC-TEST-PLAN.md`. To support another device see
-`DEVICES.md`.
+`DEVICES.md`. Note that a new device also needs an entry in `tools/prepare_qa_inputs.py` and a kas configuration in
+the Yocto image repository (see `DEVICES.md`); those changes are made there, not in this repository.
 
-This folder is self-contained. It does not build, sign or generate anything and does not need the Yocto
+The repository is self-contained. It does not build, sign or generate anything and does not need the Yocto
 repository: everything the tests need is supplied through an **inputs directory** (see below).
 
 ## Setup
 
 ```bash
+git clone <url of the rauc-test-suite repository> rauc-test-suite   # or unpack the QA package
 cd rauc-test-suite
 uv venv && uv pip install --python .venv/bin/python -r requirements.txt   # or: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp env.example .env       # then edit
@@ -52,8 +58,9 @@ which file is missing).
   inputs.json                  metadata and SHA-256 of every file; verified by TC-4.1
 ```
 
-The inputs are produced on the build host (where the Yocto build output and the signing key live) with
-`tools/prepare_qa_inputs.py` from the repository root:
+The inputs are not part of this repository. They are produced on the build host (where the Yocto build output and
+the signing key live) with `tools/prepare_qa_inputs.py` of the **Yocto image repository** (the one containing
+`kas/`, `internal/` and `build/`), run from the root of that repository:
 
 ```bash
 tools/prepare_qa_inputs.py --out qa-inputs                  # newest bundle from the build output + negative bundles
@@ -65,8 +72,12 @@ tools/prepare_qa_inputs.py --machine raspberrypi4-64 --out qa-inputs-rpi   # ano
 The generator needs `rauc`, `openssl` and `mke2fs` (negative bundles; `--skip-negative` to omit them), and `kas`
 only with `--build`. No private key is written to the output. The QA machine needs none of these tools.
 
-Shipping to QA: hand over the `--package` archive (or this folder plus the inputs directory). QA unpacks it and runs
-`./run_tests.py` as described below; no access to the repository is required.
+The output directory can be anywhere: pass it to the suite with `--inputs DIR` (absolute path, or relative to the
+current directory), or copy/symlink it to `inputs/` in this repository.
+
+Shipping to QA: hand over the `--package` archive together with this repository (a clone or an archive of it). QA
+unpacks both and runs `./run_tests.py --inputs <inputs directory>` as described below; no access to the Yocto image
+repository is required.
 
 ## Target access
 
@@ -123,13 +134,13 @@ is needed.
 ```
 results/<UTC timestamp>[_label]/        results/latest -> newest run
   RESULT-SHEET.md      one line per test: result, time, evidence directory, message
-  manifest.json        target (no secrets), profile, test-source git commit, inputs, bundle sha256, tool versions
+  manifest.json        target (no secrets), profile, git commit of this repository, inputs, bundle sha256, tool versions
   reproduce.sh         re-runs with the same arguments and the archived inputs
   SHA256SUMS           hashes of every file in the run (sha256sum -c SHA256SUMS)
   output.xml log.html report.html xunit.xml debug.log console.log   Robot Framework logs
   inputs/              test-inputs/ (bundle, expected files, negative bundles: hardlink/copy per --bundle-archive,
                        plus inputs-manifest.json with sha256), rauc-tests-sources.tar.gz, redacted env file,
-                       git diff/status (when run from a git checkout), python packages
+                       git diff/status (when this repository is a git checkout), python packages
   audit/commands.jsonl every command run on the target with timing, rc, stdout, stderr
   audit/results.jsonl  one record per finished test
   artifacts/<TC-id>_<title>/   commands.log, test.json, SHA256SUMS and files saved by the test
